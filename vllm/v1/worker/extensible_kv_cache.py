@@ -2,13 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache backing allocation that grows after warmup."""
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.utils.extensible_tensor import ExtensibleTensor
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+    create_kv_cache_views,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.gpu.attn_utils import bind_kv_caches
+from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -63,9 +71,16 @@ class ExtensibleKVCache:
         self.commit(1)
         return self.buffer.full_view()
 
-    def commit(self, num_blocks: int) -> None:
-        """Back the first ``num_blocks`` blocks; new blocks are zeroed, never shrinks."""
+    def commit(self, num_blocks: int, defragment: bool = False) -> None:
+        """Back the first ``num_blocks`` blocks; new blocks are zeroed, never shrinks.
+
+        ``defragment`` remaps each segment as one driver allocation (discarding
+        contents): UCX cannot RDMA a range spanning several allocations.
+        """
         num_blocks = min(num_blocks, self.capacity_blocks)
+        if defragment and self.buffer.num_physical_chunks > self.buffer.num_segments:
+            self.buffer.release_physical()
+            self.num_committed_blocks = 0
         if num_blocks <= self.num_committed_blocks:
             return
         self.buffer.resize_per_segment_(num_blocks * self.block_stride, zero_new=True)
@@ -76,6 +91,49 @@ class ExtensibleKVCache:
             self.capacity_blocks,
             self.physical_bytes / (1 << 30),
         )
+
+    def committed_views(
+        self,
+        kv_cache_config: KVCacheConfig,
+        layout: KVCacheLayout,
+        kernel_block_sizes: list[int] | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        """Per-layer views whose storage spans exactly the committed blocks.
+
+        ``kv_cache_config.num_blocks`` must equal the committed count. Connectors
+        derive extents from ``untyped_storage().nbytes()``, so they must not see the
+        reservation. None for layouts whose layers span several segments.
+        """
+        if not layout.is_block_compact:
+            return None
+        assert kv_cache_config.num_blocks == self.num_committed_blocks
+        segment_capacity = self.buffer.segment_capacity_bytes
+        kv_caches: dict[str, torch.Tensor] = {}
+        for tensor in kv_cache_config.kv_cache_tensors:
+            group_id, group = next(
+                (group_id, group)
+                for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                if tensor.layers[0] in group.layer_names
+            )
+            kernel_block_size = None
+            if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
+                kernel_block_size = kernel_block_sizes[group_id]
+            for layer_idx, layer_name in enumerate(tensor.layers):
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[layer_name]
+                start = tensor.offset + layer_idx * tensor.layer_stride
+                segment, offset = divmod(start, segment_capacity)
+                (view,) = create_kv_cache_views(
+                    self.buffer.segment_view(segment),
+                    spec,
+                    kv_cache_config.num_blocks,
+                    layout,
+                    replace(tensor, layers=[layer_name], offset=offset),
+                    kernel_block_size=kernel_block_size,
+                )
+                kv_caches[layer_name] = view
+        return kv_caches
 
     @property
     def physical_bytes(self) -> int:
@@ -109,15 +167,44 @@ def ensure_kv_cache_blocks(runner: "GPUModelRunner", num_blocks: int) -> None:
 
 
 def extend_kv_cache(runner: "GPUModelRunner", num_blocks: int) -> None:
-    """Commit the final KV cache size once post-warmup memory is known."""
+    """Commit the final size once post-warmup memory is known.
+
+    Afterwards the runner matches one that allocated ``num_blocks`` up front:
+    views are rebuilt over the committed bytes (same addresses) and the KV
+    connector is created against final memory.
+    """
     kv_cache = runner.extensible_kv_cache
     assert kv_cache is not None
-    kv_cache.commit(num_blocks)
+    kv_cache.commit(
+        num_blocks, defragment=runner.vllm_config.kv_transfer_config is not None
+    )
+    runner.kv_cache_config.num_blocks = kv_cache.num_committed_blocks
     logger.info(
         "Extended KV cache to %d blocks (%.2f GiB).",
         kv_cache.num_committed_blocks,
         kv_cache.physical_bytes / (1 << 30),
     )
+    forward_context = runner.compilation_config.static_forward_context
+    kv_caches = kv_cache.committed_views(
+        runner.kv_cache_config,
+        runner.cache_config.get_resolved_kv_cache_layout(),
+        runner.kernel_block_sizes,
+    )
+    if kv_caches is not None:
+        bind_kv_caches(
+            kv_caches,
+            runner.kv_caches,
+            forward_context,
+            runner.kv_cache_config,
+            runner.vllm_config,
+        )
+    else:
+        kv_caches = {
+            layer_name: layer.kv_cache
+            for layer_name, layer in forward_context.items()
+            if isinstance(getattr(layer, "kv_cache", None), torch.Tensor)
+        }
+    runner.kv_connector = get_kv_connector(runner.vllm_config, kv_caches)
 
 
 def measure_kv_cache_blocks(
