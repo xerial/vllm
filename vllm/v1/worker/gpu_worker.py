@@ -89,7 +89,6 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.extensible_kv_cache import (
-    EXTENSIBLE_KV_CACHE_MARGIN_BYTES,
     extend_kv_cache,
     measure_kv_cache_blocks,
 )
@@ -643,7 +642,7 @@ class Worker(WorkerBase):
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
             format_gib(self.init_snapshot.free_memory),
-            self.cache_config.gpu_memory_utilization,
+            self.cache_config.resolved_gpu_memory_utilization,
             format_gib(self.requested_memory),
         )
         logger.debug(
@@ -659,7 +658,7 @@ class Worker(WorkerBase):
 
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory
-            current_util = self.cache_config.gpu_memory_utilization
+            current_util = self.cache_config.resolved_gpu_memory_utilization
             cg_util_delta = cudagraph_memory_estimate / total_mem
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
                 equiv_util = round(current_util - cg_util_delta, 4)
@@ -788,6 +787,7 @@ class Worker(WorkerBase):
 
     def disable_extensible_kv_cache(self) -> None:
         self.cache_config.enable_extensible_kv_cache = False
+        self.requested_memory = request_memory(self.init_snapshot, self.cache_config)
 
     def _v2_model_runner(self) -> "GPUModelRunnerV2":
         assert self.use_v2_model_runner
@@ -818,8 +818,7 @@ class Worker(WorkerBase):
             committed_bytes=kv_cache.physical_bytes,
             requested_memory=int(self.requested_memory),
             bytes_per_block=kv_cache.bytes_per_block,
-            margin_bytes=EXTENSIBLE_KV_CACHE_MARGIN_BYTES
-            + kv_cache.commit_rounding_overhead,
+            extra_margin_bytes=kv_cache.commit_rounding_overhead,
         )
         num_blocks = (
             reserve_mm_ipc_gpu_memory(
@@ -938,7 +937,7 @@ class Worker(WorkerBase):
                 f"({format_gib(self.init_snapshot.free_memory)}/"
                 f"{format_gib(self.init_snapshot.total_memory)} GiB) on startup. "
                 f"Desired GPU memory utilization is "
-                f"({self.cache_config.gpu_memory_utilization}, "
+                f"({self.cache_config.resolved_gpu_memory_utilization}, "
                 f"{format_gib(self.requested_memory)} GiB). "
                 f"Actual usage is {format_gib(self.total_consumed)} "
                 f"GiB for consumed memory (weights + non-torch), "

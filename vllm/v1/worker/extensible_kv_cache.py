@@ -23,10 +23,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Headroom kept free after sizing the cache from measured memory, covering
-# allocations that only happen after warmup (allocator fragmentation, shapes
-# warmup did not exercise, workspaces that grow at runtime).
-EXTENSIBLE_KV_CACHE_MARGIN_BYTES = 150 * (1 << 20)
+# Headroom left after sizing from measured memory, for allocations that only
+# happen after warmup. These scale with the workload, not the device.
+KV_CACHE_MARGIN_FLOOR_BYTES = 256 * (1 << 20)
+KV_CACHE_MARGIN_FRACTION = 0.02
 
 
 class ExtensibleKVCache:
@@ -214,14 +214,17 @@ def measure_kv_cache_blocks(
     committed_bytes: int,
     requested_memory: int,
     bytes_per_block: int,
-    margin_bytes: int,
+    extra_margin_bytes: int = 0,
+    margin_floor_bytes: int = KV_CACHE_MARGIN_FLOOR_BYTES,
+    margin_fraction: float = KV_CACHE_MARGIN_FRACTION,
 ) -> int:
     """Blocks that fit in the memory measured after warmup.
 
     Everything resident except the committed KV prefix is needed by the engine;
     the cache gets the rest of the budget, capped by free memory, less
-    ``margin_bytes``.
+    ``max(margin_floor_bytes, margin_fraction * available) + extra_margin_bytes``.
     """
     non_kv_used = init_free_memory - free_memory - committed_bytes
     available = min(requested_memory - non_kv_used, free_memory + committed_bytes)
-    return max((available - margin_bytes) // bytes_per_block, 0)
+    margin = max(margin_floor_bytes, int(available * margin_fraction))
+    return max((available - margin - extra_margin_bytes) // bytes_per_block, 0)

@@ -102,16 +102,30 @@ def test_measure_kv_cache_blocks():
         free_memory=6 * gib,
         committed_bytes=1 * gib,
         bytes_per_block=gib // 4,
-        margin_bytes=0,
+        margin_floor_bytes=0,
+        margin_fraction=0.0,
     )
     # Budget-bound: 9 - 3 = 6 GiB for the KV cache.
     assert measure_kv_cache_blocks(requested_memory=9 * gib, **common) == 24
     # Free-bound: at most what is free plus what is already committed.
     assert measure_kv_cache_blocks(requested_memory=20 * gib, **common) == 28
-    # The margin comes off the top and the result never goes negative.
+    # The margin is the larger of the floor and the fraction of the budget,
+    # plus any extra, and the result never goes negative.
     assert (
         measure_kv_cache_blocks(
-            requested_memory=9 * gib, **{**common, "margin_bytes": gib}
+            requested_memory=9 * gib, **{**common, "margin_floor_bytes": gib}
+        )
+        == 20
+    )
+    assert (
+        measure_kv_cache_blocks(
+            requested_memory=9 * gib, **{**common, "margin_fraction": 0.5}
+        )
+        == 12
+    )
+    assert (
+        measure_kv_cache_blocks(
+            requested_memory=9 * gib, extra_margin_bytes=gib, **common
         )
         == 20
     )
